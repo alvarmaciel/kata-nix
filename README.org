@@ -1,0 +1,505 @@
+title:      Kata Las capas de Nix flakes y home-manager
+#+date:       [2026-09-06 Sun 12:51]
+#+filetags:   :kata:nix:
+#+STARTUP: overview
+#+OPTIONS: toc:2 num:t
+
+* Reglas del kata
+
+Estas restricciones son parte del ejercicio, no un accesorio.
+
+- [ ] *Sin LLM para resolver*. Ni para escribir el código, ni para explicar un error, ni para "confirmar si entendí". Si te trabás, el camino es el manual, el código fuente de nixpkgs, o búsqueda web.
+- [ ] *Búsqueda web permitida*. Manual de Nix, manual de nixpkgs, manual de home-manager, issues de GitHub, discourse.nixos.org.
+- [ ] *Leer el fuente cuenta como método principal*, no como último recurso. =nixpkgs= está en tu disco: =nix-instantiate --eval -E '<nixpkgs>'= te dice dónde.
+- [ ] *No avanzás de etapa* hasta poder responder las preguntas de verificación en voz alta, sin releer.
+- [ ] *Todo lo que corras, anotalo*. Un archivo de bitácora por etapa. La bitácora es el entregable real; el código es descartable.
+
+** Por qué el orden es de abajo hacia arriba
+
+Casi todo el mundo aprende Nix al revés: empieza copiando un =flake.nix= de un blog, después descubre home-manager, y nunca ve una derivation. El resultado es que puede modificar configuraciones que funcionan pero no puede diagnosticar las que no.
+
+El kata invierte eso. Cada etapa saca una capa de magia. La pregunta que tenés que poder contestar al final de cada una es siempre la misma:
+
+#+begin_quote
+¿Qué agregó exactamente esta capa que la anterior no tenía?
+#+end_quote
+
+** El mapa
+
+#+begin_example
+  ┌─────────────────────────────────────────────┐
+  │ 6. home-manager                             │  qué aspecto tiene tu $HOME
+  │    (módulos → activationPackage)            │
+  ├─────────────────────────────────────────────┤
+  │ 5. module system (lib.evalModules)          │  options / config / merge
+  ├─────────────────────────────────────────────┤
+  │ 4. nixpkgs (stdenv, lib, ~120k paquetes)    │  la biblioteca
+  ├─────────────────────────────────────────────┤
+  │ 3. lenguaje Nix                             │  evalúa a derivations
+  ├─────────────────────────────────────────────┤
+  │ 2. derivations (.drv) + /nix/store          │  EL PLAN DE BUILD
+  ├─────────────────────────────────────────────┤
+  │ 1. nix-daemon / sandbox                     │  quien realmente construye
+  └─────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────┐
+  │ FLAKES                                      │  ORTOGONAL a todo lo anterior
+  │  inputs (pinneados en flake.lock)           │  de dónde vienen las cosas
+  │  outputs (convención de nombres)            │  y cómo se descubren
+  └─────────────────────────────────────────────┘
+     No construye nada. No agrega ninguna capa
+     de build. Se conecta en el nivel 6 por UNA
+     línea. La etapa 6 del kata prueba esto.
+#+end_example
+
+** Preparación
+
+En la Framework (Ubuntu, Nix multiusuario). Verificá el punto de partida:
+
+#+begin_src sh
+nix --version
+nix config show sandbox          # en Nix viejo: nix show-config | grep sandbox
+nix config show experimental-features
+ls /nix/store | wc -l
+#+end_src
+
+Creá un directorio de trabajo *fuera* de tu repo de dotfiles:
+
+#+begin_src sh
+mkdir -p ~/kata-nix/{e0,e1,e2,e3,e4,e5,e6,e7}
+cd ~/kata-nix
+#+end_src
+
+*Advertencia*: ninguna etapa de este kata debe correr =home-manager switch= sobre tu =$HOME= real. Las etapas 5 y 6 usan =home-manager build=, que produce el resultado sin activarlo. Está explicado ahí.
+
+* Etapa 0 — Una derivation a mano
+
+*Tiempo estimado*: 45 min
+*Objetivo*: producir algo en el store sin tocar =stdenv=, sin =mkDerivation=, sin nixpkgs salvo para conseguir un =bash=.
+
+** Contexto mínimo
+
+=builtins.derivation= es la primitiva. Toma un attrset y devuelve algo que Nix puede realizar. Los campos obligatorios son tres: =name=, =system=, =builder=. Todo lo demás del attrset se convierte en variables de entorno del build.
+
+** El único andamiaje que te doy
+
+Esto es lo único del kata que viene resuelto, para que no pierdas la tarde en el arranque en frío.
+
+#+begin_src nix
+# ~/kata-nix/e0/hola.nix
+let
+  pkgs = import <nixpkgs> { };
+in
+derivation {
+  name = "hola";
+  system = "x86_64-linux";
+  builder = "${pkgs.bash}/bin/bash";
+  args = [ "-c" "echo hola > $out" ];
+}
+#+end_src
+
+#+begin_src sh
+cd ~/kata-nix/e0
+nix-build hola.nix
+cat result
+#+end_src
+
+** Trabajo
+
+1. Sacá el =args= y poné el script en un archivo aparte, pasado con =builtins.toFile= o =builtins.path=. Observá qué cambió en el store.
+2. Intentá usar =cp=, =ls= o =mkdir= dentro del builder. Va a fallar. Averiguá por qué antes de arreglarlo.
+3. Arreglalo agregando =coreutils= al =PATH=. Fijate que el =PATH= lo tenés que construir vos, a mano, desde rutas del store.
+4. Hacé una derivation con dos outputs (=outputs = [ "out" "doc" ];=) y comprobá que ambos aparecen.
+
+** Trampas comunes
+
+- =echo= funciona sin coreutils porque es builtin de bash. =ls= no. Si esto te sorprende, ahí está la lección: el sandbox está *vacío*, no hay =PATH= heredado.
+- =system= tiene que coincidir con tu plataforma. =nix config show system= te la dice.
+- =$out= no es una variable que vos definís. Nix la calcula y la inyecta.
+
+** Preguntas de verificación
+
+1. ¿De dónde salió la variable =$out=? ¿Quién la puso ahí y cuándo?
+2. Escribiste =${pkgs.bash}/bin/bash=. ¿Qué produjo esa interpolación exactamente — un string cualquiera, o algo más? ¿Qué efecto tuvo sobre las dependencias de tu derivation?
+3. ¿Por qué el builder no ve =/usr/bin=?
+4. Si borrás =/nix/store= entero y volvés a construir, ¿la ruta de salida sería la misma? ¿Por qué?
+
+*Señal de que entendiste*: podés explicar qué es una derivation sin usar la palabra "paquete".
+
+** Transferencia
+
+Una derivation es una *especificación de build declarativa, completa y serializable*. Es lo que SLSA llama =provenance=: la afirmación de qué entró, qué corrió y qué salió. La diferencia es que en la mayoría de los sistemas de CI la provenance es un documento que se emite *después* del build y describe lo que pasó; acá el documento *es* el build y existe antes.
+
+Cuando audités un pipeline en el trabajo, la pregunta equivalente es: ¿existe un artefacto que describa el build de forma completa e independiente de la máquina que lo corrió? En Nix la respuesta es sí y podés abrirlo. En un =Jenkinsfile= típico, no.
+
+** Fuentes
+
+- Manual de Nix, "Derivations": https://nixos.org/manual/nix/stable/
+- Eelco Dolstra, /The Purely Functional Software Deployment Model/ (tesis, 2006), cap. 5: https://edolstra.github.io/pubs/phd-thesis.pdf
+- https://nix.dev/tutorials/
+
+* Etapa 1 — Abrir el .drv y entender el direccionamiento
+
+*Tiempo estimado*: 1 h
+*Objetivo*: que el input-addressing deje de ser una frase y pase a ser algo que viste.
+
+** Trabajo
+
+1. Conseguí la ruta del =.drv= de tu derivation de la etapa 0:
+   #+begin_src sh
+   nix-instantiate hola.nix
+   #+end_src
+2. Abrilo con =cat=. Es texto plano (formato ATerm). Es feo. Leelo igual, entero.
+3. Ahora leelo formateado:
+   #+begin_src sh
+   nix derivation show $(nix-instantiate hola.nix) | jq
+   nix derivation show -r $(nix-instantiate hola.nix) | jq 'keys'   # recursivo
+   #+end_src
+4. Identificá cada campo: =outputs=, =inputDrvs=, =inputSrcs=, =system=, =builder=, =args=, =env=.
+5. *El experimento central*: agregá al attrset una variable de entorno que el builder no usa para nada.
+   #+begin_src nix
+   VARIABLE_INUTIL = "cualquier cosa";
+   #+end_src
+   Reconstruí. Anotá la ruta de =$out= antes y después.
+6. Volvé a sacarla. Verificá que la ruta vuelve a la original.
+7. Hacé dos derivations que produzcan *bytes de salida idénticos* pero con builders escritos distinto. Compará las rutas.
+
+** Preguntas de verificación
+
+1. La ruta cambió al agregar una variable que no se usa. ¿El hash de =/nix/store/<hash>-hola= es hash de qué, exactamente?
+2. Dos salidas idénticas byte a byte, dos rutas distintas. ¿Qué te dice eso sobre lo que Nix garantiza y lo que no?
+3. ¿Qué información contiene =inputDrvs= que =inputSrcs= no, y viceversa?
+4. Nix calcula la ruta de salida *antes* de construir. ¿Cómo es eso posible, y qué se rompería si no lo hiciera?
+5. Buscá qué son las =ca-derivations= (content-addressed). ¿Qué problema de los de arriba resuelven?
+
+*Señal de que entendiste*: podés explicar por qué el hash de una ruta del store no dice nada sobre el contenido de esa ruta.
+
+** Transferencia
+
+Este es el punto más importante del kata para tu trabajo.
+
+*Input-addressing*: el identificador se deriva del plan. Garantiza trazabilidad de origen. No garantiza nada sobre el resultado.
+
+*Content-addressing*: el identificador se deriva del artefacto. Garantiza integridad del artefacto. No dice nada de su procedencia.
+
+Casi todo el discurso de supply chain confunde las dos cosas. "Pineamos las dependencias por hash" puede significar cualquiera de las dos y las propiedades de seguridad son distintas. Un =package-lock.json= con integrity hashes es content-addressing sobre los tarballs, sin ninguna afirmación sobre cómo se produjeron. Un =flake.lock= es input-addressing sobre revisiones de git.
+
+Y acá se conecta con el paper de trusting-trust que estuviste leyendo: el ataque funciona *porque* el direccionamiento por input no puede detectarlo. La semilla mentida produce un plan cuyo hash es perfectamente correcto. La única defensa posible es reconstruir de forma independiente y comparar salidas — verificación por contenido, hecha por otro. Ese es el argumento de Wheeler sobre double-compilation diversa, y es la razón por la que los rebuilders independientes son la línea de trabajo activa, no el hashing.
+
+** Fuentes
+
+- https://arxiv.org/abs/2607.24888 (Malka, Sharma, Monperrus, Zacchiroli, Zimmermann — el paper del bootstrap)
+- David A. Wheeler, "Countering Trusting Trust through Diverse Double-Compiling": https://dwheeler.com/trusting-trust/
+- https://reproducible-builds.org
+- https://slsa.dev — leé específicamente la definición de =provenance= y compará con un =.drv=
+
+* Etapa 2 — Fixed-output derivations y la frontera de red
+
+*Tiempo estimado*: 45 min
+*Objetivo*: ubicar el único lugar del sistema donde Nix habla con internet.
+
+** Trabajo
+
+1. Escribí una derivation normal cuyo builder intente bajar algo con =curl=. Debe fallar. Anotá el error exacto.
+2. Verificá que el sandbox está activo: =nix config show sandbox=. Si dice =false=, averiguá qué significa eso para todo lo anterior antes de seguir.
+3. Convertila en FOD agregando los tres campos: =outputHash=, =outputHashAlgo=, =outputHashMode=.
+4. Ponele a propósito un =outputHash= incorrecto. Leé el mensaje de error completo.
+5. Corregilo con el hash real y verificá que ahora sí construye y sí tiene red.
+6. Andá a buscar cómo está definido =fetchurl= en nixpkgs:
+   #+begin_src sh
+   nix-instantiate --eval -E '<nixpkgs>'
+   # después: less <esa ruta>/pkgs/build-support/fetchurl/default.nix
+   #+end_src
+   Confirmá que es una FOD.
+
+** Preguntas de verificación
+
+1. ¿Por qué una FOD puede tener red y una derivation normal no? ¿Cuál es el argumento de diseño?
+2. ¿Qué pasa si dos FOD distintas declaran el mismo =outputHash=? Probalo.
+3. Todos los =fetchFromGitHub= de tu =flake.nix= y de nixpkgs son FOD. Enumerá qué estás confiando en cada una de ellas.
+4. Un mantenedor de nixpkgs manda un PR que cambia la URL y el hash de un paquete, juntos. ¿Qué verifica Nix? ¿Qué no verifica nadie?
+
+*Señal de que entendiste*: podés decir en una frase cuál es la superficie de red de un build de Nix.
+
+** Transferencia
+
+La hermeticidad de build es el requisito de nivel más alto de SLSA y la parte que casi ningún pipeline real cumple. Nix la impone por construcción y después abre *una sola puerta*, explícita y con hash declarado de antemano.
+
+Cuando revises builds ajenos, esta es la pregunta de mayor rendimiento: ¿el build tiene acceso a red? Si lo tiene, todo lo demás — firmas, attestations, SBOM — describe algo que pudo haber cambiado durante el build. Es también el mecanismo exacto de la confusión de dependencias: el build resuelve un nombre contra un índice remoto en tiempo de build.
+
+Y es la frontera donde el modelo de Nix se apoya en confianza humana: el hash garantiza que bajaste *lo mismo que bajó el mantenedor*, no que eso sea lo que publicó el upstream.
+
+* Etapa 3 — Qué agrega stdenv
+
+*Tiempo estimado*: 1 h
+*Objetivo*: separar la primitiva del wrapper. Acá se disuelve la mitad de la confusión típica con derivations.
+
+** Trabajo
+
+1. Escribí la *misma* cosa de la etapa 0, ahora con =pkgs.stdenv.mkDerivation=.
+2. Sacá los dos =.drv= a JSON y diffealos:
+   #+begin_src sh
+   nix derivation show $(nix-instantiate hola.nix) | jq -S . > /tmp/a.json
+   nix derivation show $(nix-instantiate hola-stdenv.nix) | jq -S . > /tmp/b.json
+   diff /tmp/a.json /tmp/b.json
+   #+end_src
+3. Listá todas las variables de entorno que aparecieron de más. Elegí cinco y averiguá qué hace cada una.
+4. Encontrá el =builder= que usa =mkDerivation= y leelo. Después leé =pkgs/stdenv/generic/setup.sh= en nixpkgs. No lo leas entero: buscá la función =genericBuild= y seguí las phases desde ahí.
+5. Escribí una derivation con =mkDerivation= sobreescribiendo =buildPhase= e =installPhase= a mano, sin usar ningún default.
+6. Averiguá qué es un =setup hook= y encontrá uno concreto en nixpkgs (por ejemplo el de =makeWrapper= o el de =autoPatchelfHook=).
+
+** Preguntas de verificación
+
+1. =mkDerivation= no es =derivation=. ¿Qué es, en términos del lenguaje Nix?
+2. ¿De dónde salen =buildPhase=, =installPhase= y =checkPhase=? ¿Son parte de Nix?
+3. ¿Qué es =$stdenv/setup= y en qué momento se ejecuta?
+4. Un setup hook de una dependencia puede modificar el build de tu paquete sin que vos lo pidas. ¿Eso es una feature o un problema de seguridad? Argumentá las dos posiciones.
+
+*Señal de que entendiste*: podés explicar por qué =strip= aparece en tu build sin que vos lo hayas invocado nunca. (Esto también te dice por qué el ataque del paper eligió =strip= y no otra cosa.)
+
+** Transferencia
+
+El patrón general: hay una primitiva chica y auditable, y encima una capa de conveniencia enorme que nadie lee. Las auditorías fallan en la segunda. Es idéntico a tu terreno: la primitiva de un provider de Terraform contra el módulo comunitario que lo envuelve, o la API contra el SDK.
+
+La pregunta operativa que te queda: ¿cuánto código no leído se ejecuta en cada build tuyo por el simple hecho de usar el wrapper estándar?
+
+* Etapa 4 — El module system, solo
+
+*Tiempo estimado*: 1,5 h
+*Objetivo*: ver el mecanismo que comparten NixOS y home-manager, aislado de ambos.
+
+** Trabajo
+
+1. Escribí un módulo de juguete con =lib.evalModules=. Sin NixOS, sin home-manager, sin flakes.
+   Pista: la forma es =(lib.evalModules { modules = [ ... ]; }).config=. Necesitás =lib= de nixpkgs.
+2. Declará opciones con =lib.mkOption= y tipos de =lib.types=: =str=, =bool=, =listOf=, =attrsOf=, =submodule=.
+3. Hacé que dos módulos distintos definan la *misma* opción con valores distintos. Observá el error de conflicto.
+4. Resolvelo con =mkDefault=, después con =mkForce=, después con =mkOverride= y una prioridad numérica. Entendé el orden.
+5. Usá =mkIf= y comprobá qué pasa cuando la condición es falsa: ¿la opción queda sin definir, o definida en null?
+6. Hacé un =listOf= y comprobá cómo se mergean listas de dos módulos. Después hacé lo mismo con =attrsOf=. No se comportan igual.
+7. Leé el fuente: =lib/modules.nix= en nixpkgs. Buscá =mergeDefinitions=.
+
+** Preguntas de verificación
+
+1. Un módulo tiene =options=, =config= e =imports=. ¿Cuál es la diferencia entre lo que declara y lo que define?
+2. Si tres módulos definen la misma opción sin prioridades explícitas, ¿qué hace Nix? ¿Y con tipos distintos (str vs listOf str)?
+3. ¿Cuál es la prioridad numérica de =mkDefault=? ¿Y la de =mkForce=? ¿Qué número es "más fuerte", el mayor o el menor?
+4. =mkIf false= sobre una opción que otro módulo define: ¿gana el =mkIf=, el otro, o hay error?
+
+*Señal de que entendiste*: podés predecir el valor final de una opción mirando tres módulos, sin evaluar.
+
+** Transferencia
+
+Esto es semántica de merge de configuración con precedencias implícitas. Vos convivís con la misma clase de problema en Terraform: variables por defecto, =tfvars=, variables de entorno, overrides de workspace, y un orden de precedencia que la gente cree conocer.
+
+La clase de bug de seguridad asociada es siempre la misma: *un default seguro sobreescrito silenciosamente por una capa que nadie estaba mirando*. Si podés razonar sobre el merge del module system de Nix — que es de los más explícitos que existen — vas a detectar el mismo patrón más rápido en sistemas donde la precedencia está peor documentada.
+
+* Etapa 5 — home-manager sin flakes
+
+*Tiempo estimado*: 1,5 h
+*Objetivo*: ver que home-manager es un consumidor del module system que produce *un solo derivation*.
+
+** Advertencia importante
+
+Usá =home-manager build=, *no* =switch=. =build= construye el =activationPackage= y deja un symlink =result= en el directorio actual, sin tocar tu =$HOME=. Todo el aprendizaje de esta etapa está en inspeccionar ese resultado; activarlo no aporta nada y arriesga tus dotfiles.
+
+** Trabajo
+
+1. Instalá home-manager por canales (no por flake). Buscá en el manual la sección de instalación standalone.
+2. Escribí un =home.nix= mínimo: =home.username=, =home.homeDirectory=, =home.stateVersion=, y dos o tres paquetes en =home.packages=.
+3. Agregá un dotfile con =home.file= o =xdg.configFile=.
+4. #+begin_src sh
+   home-manager build -f home.nix
+   readlink -f result
+   #+end_src
+5. *Entrá al resultado*. Es un directorio del store. Recorrelo entero:
+   #+begin_src sh
+   ls -la result/
+   find result/ -maxdepth 3 | head -50
+   #+end_src
+6. Encontrá y leé el script =activate=. Entero. Es shell. Anotá todo lo que hace.
+7. Encontrá dónde vive el dotfile que declaraste. Hacé =readlink -f= sobre él. Fijate los permisos.
+8. #+begin_src sh
+   nix derivation show $(nix-instantiate ... ) | jq
+   nix path-info -rSh ./result | tail -20
+   #+end_src
+
+** Preguntas de verificación
+
+1. El =activationPackage= es una derivation. ¿Qué tiene adentro, en tres categorías?
+2. ¿Por qué el dotfile es read-only? ¿En qué momento del pipeline se decidió eso? (Esta es la pregunta que explica por qué sacaste la config de Doom de home-manager en la Mac, y por qué Guix Home tampoco servía.)
+3. ¿Qué hace exactamente =activate= con =~/.nix-profile= y con =~/.local/state/nix/profiles/=?
+4. ¿Dónde usa home-manager el module system de la etapa 4? Encontrá la llamada a =evalModules= en su fuente.
+5. Si =activate= falla a la mitad, ¿tu home queda en un estado consistente? Leé el script y contestá con evidencia.
+
+*Señal de que entendiste*: podés describir lo que hace =home-manager switch= sin usar la palabra "mágicamente".
+
+** Transferencia
+
+Un =activationPackage= es un artefacto inmutable, versionado y con rollback, más un script imperativo que lo aplica. Es exactamente la separación entre *estado deseado* y *reconciliación*, y es el mismo modelo que =terraform plan= / =terraform apply=.
+
+Lo valioso de seguridad está en el script de activación: es el punto donde un sistema declarativo tiene que ejecutar código imperativo con los permisos del usuario. Todo sistema de este tipo tiene ese punto. Encontrarlo y leerlo es la primera cosa que hay que hacer al auditar cualquier herramienta de gestión de configuración.
+
+* Etapa 6 — El mismo home.nix, ahora en un flake
+
+*Tiempo estimado*: 1,5 h
+*Objetivo*: probar empíricamente que los flakes no cambian lo que se construye.
+*Es la única etapa con un criterio de éxito binario.*
+
+** El experimento
+
+Vas a construir el =activationPackage= de dos maneras y comparar la ruta del store. Si la afirmación "los flakes son solo una capa de inputs y entrypoints" es cierta, las rutas deben ser *idénticas*.
+
+** Trabajo
+
+1. Escribí un =flake.nix= con inputs =nixpkgs= y =home-manager=, y un output:
+   #+begin_src nix
+   homeConfigurations."alvar" = home-manager.lib.homeManagerConfiguration {
+     inherit pkgs;
+     modules = [ ./home.nix ];
+   };
+   #+end_src
+   Reusá *el mismo archivo* =home.nix= de la etapa 5. Sin copiarlo, sin modificarlo.
+2. #+begin_src sh
+   nix build .#homeConfigurations.alvar.activationPackage
+   readlink -f result
+   #+end_src
+3. Compará con la ruta de la etapa 5.
+
+** El paso que casi seguro te va a faltar
+
+Lo más probable es que las rutas *no* coincidan la primera vez. Antes de concluir nada, verificá el motivo. Casi siempre es uno solo: el =nixpkgs= del canal y el =nixpkgs= del flake son revisiones distintas.
+
+Para que el experimento pruebe algo, ambos caminos tienen que usar *exactamente el mismo* =nixpkgs= — la misma ruta del store, no "la misma versión".
+
+Pistas, en orden de menos a más explícita:
+- =nix flake metadata --json= te dice qué quedó pinneado, y =jq= te ayuda a leerlo.
+- Los inputs resueltos de un flake terminan en el store como cualquier otra cosa.
+- =nix-instantiate= y =nix-build= aceptan =-I=, y existe la variable =NIX_PATH=.
+
+Hacé que coincidan y repetí la comparación. Lo mismo vale para el =home-manager= de cada lado.
+
+** Preguntas de verificación
+
+1. Las rutas coinciden. ¿Qué probaste exactamente, y qué *no* probaste?
+2. ¿Qué agregan los flakes, entonces? Enumeralo sin decir "reproducibilidad" a secas.
+3. ¿Qué es la evaluación hermética de un flake y qué cosa concreta te prohíbe hacer?
+4. Si los flakes no cambian nada de lo que se construye, ¿por qué la comunidad los adoptó? Buscá los argumentos originales de la RFC 49 y los contraargumentos de quienes se opusieron.
+5. ¿Qué es exactamente =flake.lock=? Abrilo y describí el grafo que codifica.
+
+*Criterio de éxito*: las dos rutas del store son idénticas y podés explicar por qué eso tenía que pasar.
+
+** Transferencia
+
+Separar *procedencia de las entradas* de *definición del build* es la distinción central de supply chain, y es la que más se mezcla en la práctica. =flake.lock= responde "de dónde vino cada cosa y en qué revisión". El =.drv= responde "qué se hizo con eso". Son dos preguntas distintas y necesitás las dos para una afirmación de integridad completa.
+
+Cuando alguien dice "nuestros builds son reproducibles", la pregunta correcta se parte en dos: ¿están pinneadas las entradas, y es determinista la transformación? La mayoría de las respuestas cubren solo la primera mitad.
+
+* Etapa 7 — El mapa de confianza
+
+*Tiempo estimado*: 2 h
+*Objetivo*: convertir todo lo anterior en un número. Es la única etapa con rendimiento directo de seguridad.
+
+** Trabajo
+
+1. Grafo real de inputs de tu flake, incluyendo transitivos:
+   #+begin_src sh
+   nix flake metadata --json | jq '.locks.nodes | keys'
+   nix flake metadata --json | jq '.locks.nodes | length'
+   #+end_src
+2. Extraé la lista de *entidades distintas* (owner de GitHub, dominio) detrás de esos nodos. No de repos: de entidades. Ese número es tu conjunto de confianza.
+3. Cierre transitivo y peso de tu configuración:
+   #+begin_src sh
+   nix path-info -rSh ./result | sort -k2 -h | tail -30
+   nix path-info -r ./result | wc -l
+   #+end_src
+4. Elegí tres cosas del closure que te sorprendan y averiguá por qué están:
+   #+begin_src sh
+   nix why-depends ./result /nix/store/<lo-que-sea>
+   #+end_src
+5. Configuración de confianza efectiva de la máquina:
+   #+begin_src sh
+   nix config show substituters
+   nix config show trusted-public-keys
+   nix config show trusted-substituters
+   nix config show trusted-users
+   nix config show allowed-users
+   cat /etc/nix/nix.conf
+   cat ~/.config/nix/nix.conf 2>/dev/null
+   #+end_src
+6. Escribí el resultado como un documento de una página: entidades confiadas, tamaño del closure, y quién puede inyectar código en tu máquina sin que lo notes.
+
+** Preguntas de verificación
+
+1. ¿Cuántas entidades distintas pueden, hoy, hacer que se ejecute código en tu máquina a través de tu configuración de Nix?
+2. Para cada substituter configurado: ¿quién controla la clave privada correspondiente?
+3. Si tu usuario está en =trusted-users=: ¿qué puede hacer un flake arbitrario que corras? Buscá "trusted-users privilege escalation nix" y leé al menos dos discusiones.
+4. ¿Cuántos de los nodos de tu =flake.lock= declaraste vos y cuántos entraron por transitividad?
+5. Comparalo con lo que tenés fuera de Nix: contá los repos que Doom clonó vía straight.el (=~/.config/emacs/.local/straight/repos=) y los paquetes globales de npm. ¿Dónde está tu superficie real?
+
+*Señal de que entendiste*: tenés cuatro números y podés defender cada uno.
+
+** Transferencia
+
+Esto es un SBOM, pero derivado del build y no declarado a mano — que es la diferencia entre un SBOM que sirve y uno que se genera para cumplir un requisito. =nix why-depends= es análisis de blast radius: dado un componente comprometido, qué alcanza.
+
+Es material directo para tu trabajo, y para la columna: la brecha entre lo que la gente cree que confía y lo que confía de hecho es de uno a dos órdenes de magnitud, y acá es medible en una tarde.
+
+* Evaluación final
+
+Hacela sin notas, sin la máquina y sin buscar. Si tenés que abrir algo, esa parte no está aprendida.
+
+** Parte A — Explicación (oral o escrita, 15 min)
+
+1. Explicá qué es una derivation a alguien que sabe programar y no sabe Nix, sin usar las palabras "paquete", "instalar" ni "reproducible".
+2. Un colega dice: "el hash del store garantiza que el binario no fue alterado". Corregilo con precisión.
+3. Dibujá las capas de memoria y ubicá dónde se enchufan los flakes.
+4. Explicá por qué =xdg.configFile= produce archivos de solo lectura, partiendo de la naturaleza del store.
+
+** Parte B — Predicción (sin evaluar, 10 min)
+
+Dado un fragmento con tres módulos que definen la misma opción con distintas prioridades, predecí el valor final. Escribilo *antes* de correr nada. Después verificá.
+
+** Parte C — Práctica (1 h)
+
+Tomás un paquete cualquiera de nixpkgs que uses a diario. Sin ayuda:
+
+- [ ] Encontrá su definición en el fuente.
+- [ ] Sacá su =.drv= e identificá sus inputs directos.
+- [ ] Determiná si tiene alguna FOD en su closure inmediato y cuál.
+- [ ] Calculá cuánto pesa su closure.
+- [ ] Determiná por qué depende de tres cosas que no esperabas.
+
+** Parte D — El criterio real
+
+El kata cumplió si la próxima vez que algo de tu setup se rompa, tu primer movimiento es abrir el =.drv= o el =activationPackage= en lugar de buscar en internet una configuración que funcione.
+
+* Bitácora
+
+Un archivo por etapa. Estructura sugerida:
+
+#+begin_example
+* Etapa N — <fecha>
+** Qué corrí
+** Qué esperaba
+** Qué pasó
+** Qué no entendí todavía
+** Fuente que lo resolvió
+#+end_example
+
+La cuarta sección es la más importante. Llevá la lista de cosas no entendidas hasta el final del kata y volvé a mirarla.
+
+* Fuentes generales
+
+- Manual de Nix: https://nixos.org/manual/nix/stable/
+- Manual de nixpkgs: https://nixos.org/manual/nixpkgs/stable/
+- Manual de home-manager: https://nix-community.github.io/home-manager/
+- nix.dev (tutoriales oficiales): https://nix.dev
+- Dolstra, tesis doctoral (2006): https://edolstra.github.io/pubs/phd-thesis.pdf
+- Wheeler, DDC: https://dwheeler.com/trusting-trust/
+- Malka et al., trusting-trust vía manipulación binaria (2026): https://arxiv.org/abs/2607.24888
+- Reproducible Builds: https://reproducible-builds.org
+- SLSA: https://slsa.dev
+- Fuente de nixpkgs para leer: =lib/modules.nix=, =pkgs/stdenv/generic/setup.sh=, =pkgs/build-support/fetchurl/default.nix=
+ 
+
